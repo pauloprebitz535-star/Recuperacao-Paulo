@@ -1,6 +1,10 @@
-fastapi
-uvicorn
+fastapi[standard]
 sqlalchemy
 pyjwt
 bcrypt
 python-multipart
+pymysql
+cryptography
+python-dotenv
+sshtunnel
+paramiko<4

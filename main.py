@@ -1,8 +1,12 @@
 import os
+from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlalchemy.engine import URL
+from sshtunnel import SSHTunnelForwarder
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-
+from sqlalchemy.engine import URL
 import bcrypt
 import jwt
 from fastapi import Depends, FastAPI, Request
@@ -21,13 +25,52 @@ from sqlalchemy.orm import (
 # ----------------------------------------------------------------------
 # Configuração
 # ----------------------------------------------------------------------
+load_dotenv()
+
 SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao")
 ALGORITHM = "HS256"
 TOKEN_EXPIRA_MINUTOS = 60
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./almoxarifado.db")
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SSH_HOST = os.getenv("SSH_HOST")
+SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+SSH_USER = os.getenv("SSH_USER")
+SSH_PASSWORD = os.getenv("SSH_PASSWORD")
+
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")  # visto de dentro do servidor SSH
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+LOCAL_PORT = int(os.getenv("LOCAL_PORT", "3307"))
+
+# Se há SSH_HOST, o app conecta pela porta local do túnel; senão, direto.
+DATABASE_URL = URL.create(
+    "mysql+pymysql",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host="127.0.0.1" if SSH_HOST else DB_HOST,
+    port=LOCAL_PORT if SSH_HOST else DB_PORT,
+    database=DB_NAME,
+)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False)
+
+
+def abrir_tunel() -> SSHTunnelForwarder | None:
+    if not SSH_HOST:
+        return None
+    tunel = SSHTunnelForwarder(
+        (SSH_HOST, SSH_PORT),
+        ssh_username=SSH_USER,
+        ssh_password=SSH_PASSWORD,
+        remote_bind_address=(DB_HOST, DB_PORT),
+        local_bind_address=("127.0.0.1", LOCAL_PORT),
+        allow_agent=False,
+        host_pkey_directories=[],
+    )
+    tunel.start()
+    return tunel
 
 
 def get_db():
@@ -35,9 +78,7 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
-
-
+      db.close()
 # ----------------------------------------------------------------------
 # Entidades (banco de dados)
 # ----------------------------------------------------------------------
@@ -58,7 +99,7 @@ class Base(DeclarativeBase):
 
 
 class Usuario(Base):
-    __tablename__ = "usuarios"
+    __tablename__ = "usuarios2"
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     senha_hash: Mapped[str] = mapped_column(String(100))
@@ -66,7 +107,7 @@ class Usuario(Base):
 
 
 class Equipamento(Base):
-    __tablename__ = "equipamentos"
+    __tablename__ = "equipamentos2"
     id: Mapped[int] = mapped_column(primary_key=True)
     nome: Mapped[str] = mapped_column(String(100))
     codigo: Mapped[str] = mapped_column(String(50), unique=True, index=True)
@@ -74,18 +115,18 @@ class Equipamento(Base):
 
 
 class Emprestimo(Base):
-    __tablename__ = "emprestimos"
+    __tablename__ = "emprestimos2"
     id: Mapped[int] = mapped_column(primary_key=True)
-    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios.id"))
-    equipamento_id: Mapped[int] = mapped_column(ForeignKey("equipamentos.id"))
+    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios2.id"))
+    equipamento_id: Mapped[int] = mapped_column(ForeignKey("equipamentos2.id"))
     status: Mapped[str] = mapped_column(
         String(15), default=StatusEmprestimo.SOLICITADO.value
     )
     solicitado_em: Mapped[datetime] = mapped_column(
         default=lambda: datetime.now(timezone.utc)
     )
-    aprovado_por: Mapped[int | None] = mapped_column(ForeignKey("usuarios.id"))
-    devolvido_por: Mapped[int | None] = mapped_column(ForeignKey("usuarios.id"))
+    aprovado_por: Mapped[int | None] = mapped_column(ForeignKey("usuarios2.id"))
+    devolvido_por: Mapped[int | None] = mapped_column(ForeignKey("usuarios2.id"))
 
 
 # ----------------------------------------------------------------------
@@ -239,25 +280,38 @@ class EmprestimoOut(BaseModel):
 # ----------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Cria as tabelas e os usuários iniciais (gestor e admin)."""
-    Base.metadata.create_all(engine)
-    with SessionLocal() as db:
-        iniciais = [
-            ("admin", "admin123", Perfil.ADMIN),
-            ("gestor", "gestor123", Perfil.GESTOR),
-        ]
-        for username, senha, perfil in iniciais:
-            existe = db.scalar(select(Usuario).where(Usuario.username == username))
-            if not existe:
-                db.add(
-                    Usuario(
-                        username=username,
-                        senha_hash=gerar_hash(senha),
-                        perfil=perfil.value,
+    """Abre o túnel, conecta no banco, cria tabelas e usuários iniciais."""
+    tunel = abrir_tunel()
+    try:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as e:
+            raise RuntimeError(f"Não foi possível conectar ao banco: {e}") from e
+        print(f"✔ Conectado ao banco '{DB_NAME}'")
+
+        Base.metadata.create_all(engine)
+        with SessionLocal() as db:
+            iniciais = [
+                ("admin", "admin123", Perfil.ADMIN),
+                ("gestor", "gestor123", Perfil.GESTOR),
+            ]
+            for username, senha, perfil in iniciais:
+                existe = db.scalar(select(Usuario).where(Usuario.username == username))
+                if not existe:
+                    db.add(
+                        Usuario(
+                            username=username,
+                            senha_hash=gerar_hash(senha),
+                            perfil=perfil.value,
+                        )
                     )
-                )
-        db.commit()
-    yield
+            db.commit()
+        yield
+    finally:
+        engine.dispose()
+        if tunel:
+            tunel.stop()
 
 
 app = FastAPI(title="Almoxarifado - Cadê o Equipamento?", lifespan=lifespan)
@@ -271,7 +325,6 @@ async def tratar_erro_aplicacao(request: Request, exc: ErroAplicacao):
         content={"erro": type(exc).__name__, "detalhe": exc.detalhe},
         headers=headers,
     )
-
 
 # ----------------------------------------------------------------------
 # Autenticação
